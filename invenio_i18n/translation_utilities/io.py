@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-import json
+from json import dumps
 from pathlib import Path
 
 
@@ -19,5 +19,4 @@ def write_json_file(path: Path, data: dict) -> None:
     :param path: Where to save the file
     :param data: Dictionary to save as JSON
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    path.write_text(dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")

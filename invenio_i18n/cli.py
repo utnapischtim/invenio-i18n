@@ -10,27 +10,25 @@
 # under the terms of the MIT License; see LICENSE file for more details.
 
 """CLI for Invenio internationalization module."""
+
 import subprocess
 import traceback
-from json import JSONDecodeError, dump, load
+from json import dump
 from pathlib import Path
 
 import polib
+from click import STRING
 from click import Path as ClickPath
 from click import group, option, secho
 from flask import current_app
 from flask.cli import with_appcontext
-from invenio_base.utils import entry_points
-from jinja2 import BaseLoader, Environment
 
 from .translation_utilities import (
     collect_translations,
     write_translations_to_json,
     write_validation_report,
 )
-from .translation_utilities.collect import (
-    validate_translations as validate_translations_from_packages,
-)
+from .translation_utilities.collect import validate_translations
 from .translation_utilities.convert import po_to_i18next_json
 from .translation_utilities.discovery import (
     find_all_packages_with_translations,
@@ -41,177 +39,30 @@ from .translation_utilities.discovery import (
     find_po_files,
     normalize_package_to_module_name,
 )
-
-TRANSIFEX_CONFIG_TEMPLATE = """
-[main]
-host = https://www.transifex.com
-
-[o:inveniosoftware:p:invenio:r:{{- resource }}]
-file_filter = {{- temporary_cache }}/{{- package }}/<lang>/messages.po
-source_file = {{- package }}/assets/semantic-ui/translations/{{- package }}/translations.pot
-source_lang = en
-type = PO
-"""
+from .utils import (
+    distribute_js_translations_from_directory,
+    fetch_translations_from_transifex,
+    map_to_i18next_style,
+    update_po_file,
+)
 
 
-def source_translation_files(input_directory):
-    """Map source translation file contents to their languages."""
-    for source_file in input_directory.iterdir():
-        if not source_file.is_file() or source_file.suffix != ".json":
-            msg = f"source file: {source_file} is not meant to be distributed."
-            secho(msg)
-            continue
-
-        language = source_file.stem
-
-        with source_file.open("r") as file_handle:
-            try:
-                obj = load(file_handle)
-            except JSONDecodeError as error:
-                tb = traceback.format_exc()
-                msg = f"ERROR: source file: {source_file.name} couldn't be loaded because of error: {str(error)}\n{tb}"
-                secho(msg)
-            else:
-                yield language, obj
+def _convert_to_list(ctx, param, value):
+    """Convert Click's tuple from multiple=True to a list."""
+    if value is None:
+        return []
+    return list(value)
 
 
-def calculate_target_packages(
-    exceptional_package_names,
-    entrypoint_group,
-    language,
-):
-    """Calculate target package translation paths.
-
-    Maps each package to its target translation file path by inspecting entrypoint and handling exceptional package names.
-    """
-    package_translations_paths = {}
-
-    for entry_point in entry_points(group=entrypoint_group):
-        package_name = entry_point.name
-        package_path = Path(entry_point.load().path)
-
-        # Some webpack entry points use names that differ from their package names.
-        # Map these exceptional webpack entry‑point names to their correct package names.
-        package_name = exceptional_package_names.get(package_name, package_name)
-
-        target_translations_path = (
-            package_path / "translations" / package_name / "messages" / language
-        )
-
-        package_translations_paths[package_name] = (
-            target_translations_path / "translations.json"
-        )
-
-    return package_translations_paths
-
-
-def create_transifex_configuration(temporary_cache, js_resources):
-    """Create a transifex fetch configuration.
-
-    This configuration is built dynamically because the targeted packages are
-    customizable over the configuration variable I18N_TRANSIFEX_JS_RESOURCES_MAP.
-    """
-    environment = Environment(loader=BaseLoader())
-    config_template = environment.from_string(TRANSIFEX_CONFIG_TEMPLATE)
-
-    with Path(temporary_cache / "collected_config").open("w") as fp:
-        for resource, package in js_resources.items():
-            config = config_template.render(
-                temporary_cache=temporary_cache,
-                resource=resource,
-                package=package,
-            )
-            fp.write(config)
-            fp.write("\n\n")
-
-
-def fetch_translations_from_transifex(token, temporary_cache, languages, js_resources):
-    """Fetch translations from transifex."""
-    temporary_cache.mkdir(parents=True, exist_ok=True)
-
-    create_transifex_configuration(temporary_cache, js_resources)
-
-    transifex_pull_cmd = [
-        "tx",
-        f"--token={token}",
-        f"--config={temporary_cache}/collected_config",
-        "pull",
-        f"--languages={languages}",
-        "--force",
-    ]
-    result = subprocess.run(transifex_pull_cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        secho(f"Error fetching from Transifex: {result.stderr}")
-        raise RuntimeError(
-            f"Transifex pull failed with return code {result.returncode}"
-        )
-
-
-def map_to_i18next_style(po_file):
-    """Map translations from po to i18next style.
-
-    Plurals need a special format.
-    """
-    obj = {}
-    for entry in po_file:
-        obj[entry.msgid] = entry.msgstr
-        if entry.msgstr_plural:
-            obj[entry.msgid] = entry.msgstr_plural[0]
-            obj[entry.msgid + "_plural"] = entry.msgstr_plural[1]
-    return obj
+def _create_directory(ctx, param, value):
+    output_dir = Path(value)
+    output_dir.parent.mkdir(exist_ok=True)
 
 
 @group(chain=True)
 @with_appcontext
 def i18n():
     """i18n commands."""
-
-
-def distribute_js_translations_from_directory(
-    input_directory: Path, entrypoint_group: str = "invenio_assets.webpack"
-):
-    """Distribute JavaScript translations from JSON files to installed packages.
-
-    This is a helper function which reads unified JSON files per language (e.g., de.json, en.json)
-    from a translation bundle directory and distributes them to package asset directories.
-
-    The translation bundle should contain JSON files named after locale codes:
-    - ``de.json`` for German translations
-    - ``en.json`` for English translations
-
-    :param input_directory: containing JSON files - translation bundle
-    :param entrypoint_group: Entrypoint group for discovering package paths
-    :raises RuntimeError: If distribution fails
-    """
-    exceptional_package_names = current_app.config.get(
-        "I18N_JS_DISTR_EXCEPTIONAL_PACKAGE_MAP", {}
-    )
-
-    for language, unified_translations in source_translation_files(input_directory):
-        target_packages = calculate_target_packages(
-            exceptional_package_names, entrypoint_group, language
-        )
-
-        for package_name, translations in unified_translations.items():
-            if package_name not in target_packages:
-                msg = (
-                    f"Package {package_name} doesn't have webpack entrypoint. "
-                    "Skipping..."
-                )
-                secho(msg)
-                continue
-
-            target_file = target_packages[package_name]
-            target_file.parent.mkdir(parents=True, exist_ok=True)
-
-            with target_file.open("w", encoding="utf-8") as file_pointer:
-                dump(translations, file_pointer, indent=2, ensure_ascii=False)
-
-            msg = (
-                f"{package_name} translations for language {language} "
-                "have been written."
-            )
-            secho(msg)
 
 
 @i18n.command()
@@ -299,13 +150,6 @@ def distribute_js_translations(input_directory: Path):
         raise
 
 
-def _convert_to_list(ctx, param, value):
-    """Convert Click's tuple from multiple=True to a list."""
-    if value is None:
-        return []
-    return list(value)
-
-
 @i18n.command()
 @option(
     "--packages",
@@ -316,11 +160,36 @@ def _convert_to_list(ctx, param, value):
 )
 @option(
     "--all-packages",
-    "--global",
     is_flag=True,
     help="Collect from all invenio_* packages",
 )
-def create_global_pot(packages: list[str] | None, all_packages: bool):
+@option("--all-locales", is_flag=True, help="Use all languages")
+@option(
+    "--locale",
+    "-l",
+    "locales",
+    multiple=True,
+    callback=_convert_to_list,
+    help="Languages to include",
+)
+@option("--prefix", type=STRING, default="invenio_")
+@option(
+    "--path-to-global-pot",
+    "output_file",
+    type=ClickPath(dir_okay=False, file_okay=True, writable=True, path_type=Path),
+    callback=_create_directory,
+)
+@option("--write-package-wise-too", is_flag=True, default=False)
+def create_global_pot(
+    packages: list[str] | None,
+    locales: list[str] | None,
+    prefix: str,
+    output_file: Path,
+    *,
+    all_packages: bool,
+    all_locales: bool,
+    write_package_wise_too: bool,
+):
     """Collect translations and write JSON files for testing.
 
     Collects PO translations from packages and converts them to JSON format.
@@ -330,30 +199,37 @@ def create_global_pot(packages: list[str] | None, all_packages: bool):
         invenio i18n create-global-pot -p invenio-app-rdm -p invenio-rdm-records
         invenio i18n create-global-pot --all-packages
     """
+    if all_packages and packages:
+        secho(
+            "Error: Provide --packages or --all-packages, they are mutual exclusive",
+            fg="red",
+        )
+
+    if all_locales and locales:
+        secho(
+            "Error: Provide --locales or --all-locales, they are mutual exclusive",
+            fg="red",
+        )
+
     if all_packages:
-        if packages:
-            secho("Warning: --all-packages ignores --packages")
         packages = [
-            name for name, _ in find_all_packages_with_translations(prefix="invenio_")
+            name for name, _ in find_all_packages_with_translations(prefix=prefix)
         ]
-    elif not packages:
-        secho("Error: Provide --packages or --all-packages")
-        return
 
-    output_dir = Path.cwd() / "i18n-collected"
-    output_dir.mkdir(exist_ok=True)
-    collected_data = collect_translations(packages)
-    write_translations_to_json(collected_data, output_dir)
-    secho(
-        f"Collected translations for {collected_data['packagesProcessed']} packages into {output_dir}",
-    )
-    secho(f"Wrote merged JSON: {output_dir / 'translations.json'}")
-    secho(
-        "Per‑package JSON under: i18n-collected/<package>/translations.json",
-    )
+    if all_locales:
+        raise RuntimeError("--all-locales not implemented yet, use --locale")
+
+    try:
+        package_translations = collect_translations(packages, locales)
+        write_translations_to_json(
+            package_translations, output_file, locales, write_package_wise_too
+        )
+        secho(f"Collected translations for {len(packages)}.", fg="green")
+    except Exception as error:
+        secho(str(error), fg="red")
 
 
-@i18n.command()
+@i18n.command("validate-translations")
 @option(
     "--packages",
     "-p",
@@ -367,7 +243,7 @@ def create_global_pot(packages: list[str] | None, all_packages: bool):
     is_flag=True,
     help="Validate all invenio_* packages",
 )
-def validate_translations(packages: list[str] | None, all_packages: bool):
+def cmd_validate_translations(packages: list[str] | None, all_packages: bool):
     """Validate translation quality.
 
     Checks PO files for missing, fuzzy, and obsolete translations.
@@ -387,118 +263,22 @@ def validate_translations(packages: list[str] | None, all_packages: bool):
         secho("Error: Provide --packages or --all-packages")
         return
 
-    output_dir = Path.cwd() / "i18n-collected"
-    output_dir.mkdir(exist_ok=True)
+    # TODO: move this to click option
+    # output_dir = Path.cwd() / "i18n-collected"
+    # output_dir.mkdir(exist_ok=True)
 
-    summary = validate_translations_from_packages(packages)
-    write_validation_report(summary, output_dir)
-    report_path = output_dir / "validation-report.json"
-    secho(f"Validation report written: {report_path}")
+    summary = validate_translations(packages)
 
-    summary_data = summary.get("summary", {})
-    secho(
-        f"Summary: packages={summary_data.get('totalPackages', 0)}, "
-        f"locales={summary_data.get('totalLocales', 0)}, "
-        f"issues={summary_data.get('totalIssues', 0)}",
-    )
-
-
-def has_translation_key(po_path: Path, msgid: str, match_prefix: bool) -> bool:
-    """Check if PO file contains the translation key."""
-    try:
-        po_file = polib.pofile(str(po_path))
-        if match_prefix:
-            return any(entry.msgid.startswith(msgid) for entry in po_file)
-        return po_file.find(msgid) is not None
-    except Exception:
-        return False
-
-
-def update_po_file(
-    po_path: Path,
-    msgid: str,
-    msgstr: str,
-    match_prefix: bool = False,
-    target_name: str | None = None,
-) -> tuple[bool, bool]:
-    """Update PO file with translation."""
-    try:
-        po_file = polib.pofile(str(po_path))
-    except Exception as e:
-        secho(f"Error opening {po_path}: {e}")
-        return False, False
-
-    updated = False
-    created_new = False
-    count = 0
-
-    def remove_fuzzy_flag(entry):
-        if isinstance(entry.flags, list):
-            if "fuzzy" in entry.flags:
-                entry.flags.remove("fuzzy")
-        else:
-            entry.flags.discard("fuzzy")
-
-    for entry in po_file:
-        if (match_prefix and entry.msgid.startswith(msgid)) or entry.msgid == msgid:
-            entry.msgstr = msgstr
-            remove_fuzzy_flag(entry)
-            updated = True
-            count += 1
-            if not match_prefix:
-                break
-
-    if not updated or match_prefix:
-        for entry in list(po_file.obsolete_entries()):
-            if (match_prefix and entry.msgid.startswith(msgid)) or entry.msgid == msgid:
-                entry.msgstr = msgstr
-                remove_fuzzy_flag(entry)
-                entry.obsolete = False
-                po_file.append(entry)
-                updated = True
-                count += 1
-                if not match_prefix:
-                    break
-
-    if not updated and not match_prefix:
-        po_file.append(polib.POEntry(msgid=msgid, msgstr=msgstr))
-        updated = True
-        created_new = True
-
-    if not updated:
-        return False, False
-
-    try:
-        po_file.save()
-    except Exception as e:
-        secho(f"Error saving {po_path}: {e}")
-        return False, False
-
-    is_js_po = (
-        "assets" in str(po_path)
-        or "messages.po" in str(po_path)
-        and "LC_MESSAGES" not in str(po_path)
-    )
-    if not is_js_po:
-        translations_dir = po_path.parent.parent.parent
-        result = subprocess.run(
-            ["pybabel", "compile", "-d", str(translations_dir)],
-            capture_output=True,
-            text=True,
-        )
-
-        if result.returncode != 0:
-            secho(f"Warning: Failed to compile: {result.stderr}")
-
-    name = target_name or po_path
-    if match_prefix:
-        secho(f"Updated {count} translation(s) matching '{msgid}' in {name}")
-    elif created_new:
-        secho(f"Created '{msgid}' in {name}")
-    else:
-        secho(f"Updated '{msgid}' in {name}")
-
-    return updated, created_new
+    # todo move code/functionality to the corresponding dataclass ValidationSummary
+    # write_validation_report(summary, output_dir)
+    # report_path = output_dir / "validation-report.json"
+    # secho(f"Validation report written: {report_path}")
+    # summary_data = summary.get("summary", {})
+    # secho(
+    #     f"Summary: packages={summary_data.get('totalPackages', 0)}, "
+    #     f"locales={summary_data.get('totalLocales', 0)}, "
+    #     f"issues={summary_data.get('totalIssues', 0)}",
+    # )
 
 
 @i18n.command()

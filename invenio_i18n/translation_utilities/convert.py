@@ -9,18 +9,33 @@
 
 from __future__ import annotations
 
-import polib
+from polib import POFile
 
 from .discovery import normalize_package_to_module_name
 
 
-def po_to_i18next_json(po_file: polib.POFile, package_name: str) -> dict[str, str]:
+def po_to_i18next_json(po_file: POFile, package_name: str) -> dict[str, str]:
     """Convert PO file to JSON format.
 
     :param po_file: The translation file to convert
     :param package_name: Name of the package
     :return: Dictionary with translations like {"Hello": "Hallo"}
+
     """
+    # TODO:
+    # i think the result structure is wrong, it should have the format
+    # {
+    #   "package_name": {
+    #     "msgid": "value",
+    #   }
+    # }
+    #
+    # and not
+    #
+    # {
+    #   "package_name:msgid": "value",
+    # }
+
     result: dict[str, str] = {}
     normalized_package = normalize_package_to_module_name(package_name)
 
@@ -33,7 +48,6 @@ def po_to_i18next_json(po_file: polib.POFile, package_name: str) -> dict[str, st
             continue
 
         if entry.msgstr_plural:
-
             singular_value = (entry.msgstr_plural.get(0) or base_key).strip()
             plural_value = (entry.msgstr_plural.get(1) or base_key).strip()
 

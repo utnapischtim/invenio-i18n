@@ -27,7 +27,7 @@ def normalize_package_to_module_name(package_name: str) -> str:
     return package_name.replace("-", "_")
 
 
-def find_package_path(package_name: str) -> Path | None:
+def find_package_path(package_name: str) -> Path:
     """Find where a package is installed on your computer.
 
     :param package_name: Name of the package to find
@@ -36,7 +36,8 @@ def find_package_path(package_name: str) -> Path | None:
     module_name = normalize_package_to_module_name(package_name)
     spec = find_spec(module_name)
     if not spec or not spec.submodule_search_locations:
-        return None
+        msg = f"Package: {package_name} not found."
+        raise RuntimeError(msg)
     return Path(list(spec.submodule_search_locations)[0])
 
 
@@ -126,7 +127,8 @@ def find_all_bundles() -> Iterable[tuple[str, Path]]:
 
 
 def find_js_po_files(
-    package_root: Path, package_name: str
+    package_root: Path,
+    package_name: str,
 ) -> Iterable[tuple[str, Path]]:
     """Find all JavaScript translation files (messages-js.po) in a package.
 
@@ -182,7 +184,7 @@ def find_all_packages_with_translations(
 
             package_root = find_package_path(package_name)
             if package_root:
-                for _loc, _path in find_po_files(package_root, package_name):
+                for _, _ in find_po_files(package_root, package_name):
                     seen.add(package_name)
                     yield package_name, package_root
                     break
@@ -200,7 +202,7 @@ def find_all_packages_with_translations(
 
                 package_root = find_package_path(package_name)
                 if package_root:
-                    for _loc, _path in find_po_files(package_root, package_name):
+                    for _, _ in find_po_files(package_root, package_name):
                         seen.add(package_name)
                         yield package_name, package_root
                         break
